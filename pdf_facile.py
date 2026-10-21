@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QC
                                QStackedWidget, QToolButton, QVBoxLayout, QWidget)
 
 APP_NAME = "PDF Facile"
-APP_VERSION = "1.6"
+APP_VERSION = "1.7"
 APP_URL = "https://github.com/sebastien-vedrine/PDF-Facile"
 ORG_NAME = "PDFFacile"
 MAX_UNDO = 30
@@ -284,6 +284,34 @@ def _is_blank(t):
     return bool(COMB_RE.match(t) and t.count("_") >= 2) or bool(LINE_RE.match(t))
 
 
+def _split_glued(page, words):
+    """« Nom______ » ou « _____/ » → le libellé et la ligne à remplir deviennent deux mots."""
+    out, chars = [], None
+    for w in words:
+        t = w[4]
+        if not re.search(r"_{4,}", t) or _is_blank(t):
+            out.append(w)
+            continue
+        parts = [p for p in re.split(r"(_{4,})", t) if p]
+        if chars is None:
+            chars = [ch for b in page.get_text("rawdict")["blocks"] for l in b.get("lines", [])
+                     for sp in l["spans"] for ch in sp["chars"] if ch["c"].strip()]
+        r = pymupdf.Rect(w[:4])
+        mine = sorted((ch for ch in chars if r.contains((pymupdf.Rect(ch["bbox"]).tl + pymupdf.Rect(ch["bbox"]).br) / 2)),
+                      key=lambda ch: ch["bbox"][0])
+        exact = "".join(ch["c"] for ch in mine) == t
+        i = 0
+        for p in parts:
+            if exact:
+                x0, x1 = mine[i]["bbox"][0], mine[i + len(p) - 1]["bbox"][2]
+            else:                         # repli : découpe proportionnelle au nombre de caractères
+                x0 = r.x0 + r.width * i / len(t)
+                x1 = r.x0 + r.width * (i + len(p)) / len(t)
+            out.append((x0, w[1], x1, w[3], p) + tuple(w[5:]))
+            i += len(p)
+    return out
+
+
 def ink_bbox(page, r):
     """Contour réel (pixels foncés) d'un petit symbole, ex. la case « □ » d'une police."""
     clip = pymupdf.Rect(r) + (-1, -1, 1, 1)
@@ -376,22 +404,26 @@ def _sections(page, boxes):
 def detect_fields(page, ctx):
     """Renvoie les cases probables d'une page (coordonnées non tournées).
     ctx = {"section": …, "prev": …} est transmis d'une page à la suivante."""
-    words = page.get_text("words")
+    words = _split_glued(page, page.get_text("words"))
     plain = [w for w in words if not _is_blank(w[4])]
     cands = []
 
-    def text_above(x0, x1, top):
+    def text_above(x0, x1, top, need_colon=False):
         """Libellé placé sur la ligne du dessus (ex. « … à la mairie de : » puis une ligne vide)."""
         above = [w for w in plain if top - 16 < w[3] <= top + 2 and w[2] > x0 - 2 and w[0] < x1]
         if not above:
             return ""
         y = max(w[3] for w in above)
         line = sorted((w for w in above if abs(w[3] - y) < 3), key=lambda w: w[0])
+        if need_colon and not line[-1][4].endswith(":"):
+            return ""
         return _clean_label(" ".join(w[4] for w in line[-8:]))
 
     def add_line(x0, x1, y, source):
         top = y - 14
-        prev = [c for c in cands if c["kind"] == "text" and 0 < y - c["rect"].y1 < 34]
+        prev = [c for c in cands if c["kind"] == "text" and 0 < y - c["rect"].y1 < 34
+                and not (source == "text" and y - c["rect"].y1 < 2       # « Nom___ Prénom___ »
+                         and (c["rect"].x1 <= x0 or c["rect"].x0 >= x1))]
         if prev:
             top = max(top, max(c["rect"].y1 for c in prev) + 1)
         r = pymupdf.Rect(x0 + 1, top, x1, y - 0.5)
@@ -405,11 +437,13 @@ def detect_fields(page, ctx):
         label = _left_label(words, x0, top, y + 1)
         if not label:
             near = [c for c in cands if c["kind"] == "text" and 0 < y - c["rect"].y1 < 34
-                    and abs(c["rect"].x1 - x1) < 40]
+                    and abs(c["rect"].x1 - x1) < 40
+                    and (source == "text" or c["rect"].width > 0.6 * (x1 - x0))]  # pas le bord d'un cadre
             if near:
                 label = near[-1]["label"].split(" (suite)")[0] + " (suite)"
             elif source == "text":    # un trait dessiné sans libellé est souvent une bordure de tableau
-                label = text_above(x0, x1, top)
+                # une très longue ligne de « ___ » sans « : » au-dessus sépare deux parties de la page
+                label = text_above(x0, x1, top, need_colon=x1 - x0 > 0.5 * page.rect.width)
         if not label:
             return
         cands.append({"kind": "text", "rect": r, "label": label})
@@ -424,8 +458,34 @@ def detect_fields(page, ctx):
                               "label": _left_label(words, w[0], w[1], w[3]) or text_above(w[0], w[2], w[1])})
     # 2) lignes : tirets bas tapés au clavier (« ______ ») ou traits dessinés
     lines = []
+    # « ____/ ____/ ______ » : jour, mois et année, chacun sur son trait
+    seq = sorted((w for w in words if re.fullmatch(r"_{2,}|/", w[4])), key=lambda w: (round(w[3]), w[0]))
+    runs, used = [], set()
+    for w in seq:
+        if runs and abs(runs[-1][-1][3] - w[3]) < 2 and w[0] - runs[-1][-1][2] < 12:
+            runs[-1].append(w)
+        else:
+            runs.append([w])
+    for run in runs:
+        segs = [w for w in run if w[4] != "/"]
+        if len(segs) < 2 or len(segs) == len(run):
+            continue
+        used.update(id(w) for w in run)
+        y = run[0][3] - 1.5
+        base = _left_label(words, run[0][0], run[0][1], run[0][3]) or text_above(run[0][0], run[-1][2], y - 14)
+        if len(segs) != 3:
+            lines.append((run[0][0], run[-1][2], y, "text"))
+            continue
+        if len(base) <= 3:            # « Le ___/___/___ »
+            base = "Date"
+        for w, part in zip(segs, ("jour", "mois", "année")):
+            top = max([y - 14] + [c["rect"].y1 + 1 for c in cands if 0 < y - c["rect"].y1 < 34
+                                  and c["rect"].x0 < w[2] and c["rect"].x1 > w[0]])
+            r = pymupdf.Rect(w[0] + 1, top, w[2], y - 0.5)
+            if r.height >= 6 and not any(c["rect"].intersects(r) for c in cands):
+                cands.append({"kind": "text", "rect": r, "label": f"{base} — {part}", "date": True})
     for w in words:
-        if LINE_RE.match(w[4]):
+        if LINE_RE.match(w[4]) and id(w) not in used:
             lines.append((w[0], w[2], w[3] - 1.5, "text"))
     for d in page.get_drawings():
         for it in d["items"]:
@@ -480,7 +540,7 @@ def detect_fields(page, ctx):
             base = prev.split(" (suite)")[0]
             short = {"à": "lieu", "le": "date", "i": "suite", "": "suite"}.get(c["label"].lower(), c["label"])
             c["label"] = f"{base} — {short}"
-        elif c["kind"] != "check":
+        elif c["kind"] != "check" and not c.get("date"):
             prev = c["label"]
     ctx["prev"] = prev
     # sections
@@ -1393,6 +1453,11 @@ class FormPanel(QFrame):
                     else:
                         if w.text_maxlen and w.text_maxlen > 0:
                             ed.setMaxLength(w.text_maxlen)
+                        if (w.field_name or "").startswith("pf_p"):
+                            hint = {"jour": "JJ", "mois": "MM", "année": "AAAA"}.get(label.rsplit(" — ", 1)[-1])
+                            if hint:
+                                ed.setPlaceholderText(hint)
+                                ed.setMaxLength(len(hint))
                         ed.textChanged.connect(lambda t, x=xref: self._queue_text(x, t))
                     ed.editingFinished.connect(self.flush)
                 ed.setReadOnly(readonly)

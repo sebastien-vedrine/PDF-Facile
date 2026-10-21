@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.7
+- Field detection: labels glued to their line ("Nom____"), dates "__/__/____" split into day / month / year with JJ / MM / AAAA hints, side-by-side fields on the same line.
+- Fewer false fields: long separator lines and box borders are no longer taken for fields.
+
 ## 1.6
 - "Réduire la taille": compress a copy of the PDF, with an optional maximum size (e.g. 2 Mo) and black & white option.
 - Compact toolbar that fits 1280 px wide screens.

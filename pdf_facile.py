@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QC
                                QStackedWidget, QToolButton, QVBoxLayout, QWidget)
 
 APP_NAME = "PDF Facile"
-APP_VERSION = "1.7"
+APP_VERSION = "1.8"
 APP_URL = "https://github.com/sebastien-vedrine/PDF-Facile"
 ORG_NAME = "PDFFacile"
 MAX_UNDO = 30
@@ -257,11 +257,11 @@ def create_check_annot(doc, page, cx, cy, size, mark):
     return a
 
 
-def find_boxes(page):
+def find_boxes(page, drawings=None):
     """Repère les petites cases carrées dessinées sur la page (formulaires « à imprimer »)."""
     out = []
     try:
-        drawings = page.get_drawings()
+        drawings = page.get_drawings() if drawings is None else drawings
     except Exception:
         return out
     rm = page.rotation_matrix
@@ -277,22 +277,30 @@ def find_boxes(page):
 # --- Détection des cases sur un formulaire « à imprimer » ---------------------
 COMB_RE = re.compile(r"^[Il|\[]?(?:_+[Il|\]])+$")
 LINE_RE = re.compile(r"^_{5,}[.,;:]?$")
+LEADER_RE = re.compile(r"(?:\.*…){3,}[.…]*|\.{6,}")          # « ……………… » ou « .......... »
+GLUED_RE = re.compile(r"(_{4,}|(?:\.*…){3,}[.…]*|\.{6,})")
+SHORT_WORDS = {"le": "Date", "à": "Lieu", "du": "Du", "au": "Au"}   # « Le ……  à …… », « du …… au …… »
 BOX_GLYPHS = set("□☐❑❒▢\uf06f\uf0a8\uf071\uf072")
 
 
 def _is_blank(t):
-    return bool(COMB_RE.match(t) and t.count("_") >= 2) or bool(LINE_RE.match(t))
+    return bool(COMB_RE.match(t) and t.count("_") >= 2) or bool(LINE_RE.match(t)) or bool(LEADER_RE.fullmatch(t))
+
+
+def _is_bullet(t):
+    """« - », « • », ou un symbole d'une police à pictogrammes en tête de ligne."""
+    return len(t) == 1 and not t.isalnum() and t not in ":;,.!?()/'’\"«»" and t not in BOX_GLYPHS
 
 
 def _split_glued(page, words):
-    """« Nom______ » ou « _____/ » → le libellé et la ligne à remplir deviennent deux mots."""
+    """« Nom______ », « _____/ » ou « ……en » → le libellé et la ligne à remplir deviennent deux mots."""
     out, chars = [], None
     for w in words:
         t = w[4]
-        if not re.search(r"_{4,}", t) or _is_blank(t):
+        if not GLUED_RE.search(t) or _is_blank(t):
             out.append(w)
             continue
-        parts = [p for p in re.split(r"(_{4,})", t) if p]
+        parts = [p for p in GLUED_RE.split(t) if p]
         if chars is None:
             chars = [ch for b in page.get_text("rawdict")["blocks"] for l in b.get("lines", [])
                      for sp in l["spans"] for ch in sp["chars"] if ch["c"].strip()]
@@ -354,11 +362,11 @@ def _left_label(words, x, y0, y1):
     return _clean_label(" ".join(run))
 
 
-def _right_label(words, x, y0, y1, limit=70):
+def _right_label(words, x, y0, y1, limit=70, first_gap=22):
     cand = sorted((w for w in words if _vband(w[1], w[3], y0, y1) > 2 and w[0] >= x - 1), key=lambda w: w[0])
     run, left = [], x
     for w in cand:
-        if w[0] - left > (22 if not run else 10) or _is_blank(w[4]):
+        if w[0] - left > (first_gap if not run else 10) or _is_blank(w[4]):
             break
         run.append(w[4])
         left = w[2]
@@ -406,6 +414,7 @@ def detect_fields(page, ctx):
     ctx = {"section": …, "prev": …} est transmis d'une page à la suivante."""
     words = _split_glued(page, page.get_text("words"))
     plain = [w for w in words if not _is_blank(w[4])]
+    drawings = page.get_drawings()            # lent sur les plans : lu une seule fois
     cands = []
 
     def text_above(x0, x1, top, need_colon=False):
@@ -487,7 +496,11 @@ def detect_fields(page, ctx):
     for w in words:
         if LINE_RE.match(w[4]) and id(w) not in used:
             lines.append((w[0], w[2], w[3] - 1.5, "text"))
-    for d in page.get_drawings():
+        elif LEADER_RE.fullmatch(w[4]):
+            after = [o for o in words if abs(o[3] - w[3]) < 2 and 0 <= o[0] - w[2] < 25]
+            if not any(re.search(r"\d", o[4]) for o in after):     # sommaire, montant : « Total ....... 12 »
+                lines.append((w[0], w[2], w[3] - 1.5, "text"))
+    for d in drawings:
         for it in d["items"]:
             if it[0] == "re" and it[1].height < 2.5 and it[1].width > 25:
                 lines.append((it[1].x0, it[1].x1, it[1].y0, "draw"))
@@ -498,7 +511,7 @@ def detect_fields(page, ctx):
         add_line(x0, x1, y, src)
     # 3) cases à cocher
     blocks = page.get_text("blocks")
-    boxes = find_boxes(page) if page.rotation == 0 else []
+    boxes = find_boxes(page, drawings) if page.rotation == 0 else []
     if page.rotation == 0:
         try:
             for b in page.get_text("rawdict")["blocks"]:
@@ -517,6 +530,8 @@ def detect_fields(page, ctx):
         if any(c["rect"].intersects(b) for c in cands):
             continue
         label = _right_label(words, b.x1, b.y0, b.y1)
+        if not label:                 # « ❑ ⇥ DC1 » : libellé après une tabulation
+            label = _right_label(words, b.x1, b.y0, b.y1, first_gap=60)
         # « Oui ☐  Non ☐ » : le libellé est à gauche de chaque case
         right = [w for w in words if _vband(w[1], w[3], b.y0, b.y1) > 2 and 0 <= w[0] - b.x1 < 12]
         left = [w for w in words if _vband(w[1], w[3], b.y0, b.y1) > 2 and 0 <= b.x0 - w[2] < 10]
@@ -532,6 +547,139 @@ def detect_fields(page, ctx):
                 q = q if len(q) <= 70 else q[:67] + "… ?"
                 label = f"{q} — {label}" if label else q
         cands.append({"kind": "check", "rect": pymupdf.Rect(b), "label": label or "Case à cocher"})
+    # cadres dessinés (rectangles, ou quatre traits) : grandes zones à rédiger, limites des cases
+    frames, hz, vt = [], [], []
+    for d in drawings:
+        for it in d["items"]:
+            if it[0] == "re" and it[1].width > 5 and it[1].height > 5 and not d.get("fill"):
+                frames.append(pymupdf.Rect(it[1]))
+            elif it[0] == "l" and abs(it[1].y - it[2].y) < 1 and abs(it[1].x - it[2].x) >= 150:
+                hz.append((min(it[1].x, it[2].x), max(it[1].x, it[2].x), it[1].y))
+            elif it[0] == "l" and abs(it[1].x - it[2].x) < 1 and abs(it[1].y - it[2].y) >= 20:
+                vt.append((it[1].x, min(it[1].y, it[2].y), max(it[1].y, it[2].y)))
+    if len(hz) <= 60:                 # grands cadres faits de quatre traits (pas les plans ni les tableaux serrés)
+        for a in hz:
+            for b in hz:
+                if b[2] - a[2] > 50 and abs(a[0] - b[0]) < 3 and abs(a[1] - b[1]) < 3 and all(
+                        any(abs(v[0] - x) < 3 and v[1] < a[2] + 3 and v[2] > b[2] - 3 for v in vt) for x in (a[0], a[1])):
+                    frames.append(pymupdf.Rect(a[0], a[2], a[1], b[2]))
+    frames = [f for i, f in enumerate(frames) if not any((f & g).get_area() > 0.9 * f.get_area() for g in frames[:i])]
+    # 4) grand cadre vide sous « Evaluation … : » → zone de texte sur plusieurs lignes
+    for f in frames:
+        if f.width < 150 or f.height < 50:
+            continue
+        inside = [w for w in plain if f.contains(pymupdf.Rect(w[:4]))]
+        top = max([f.y0] + [w[3] for w in inside])
+        if f.y1 - top < 40:
+            continue
+        if inside:
+            last = [w for w in inside if w[3] > top - 30]
+            raw = " ".join(w[4] for w in sorted(last, key=lambda w: (round(w[3]), w[0])))
+            if not raw.rstrip().endswith(":"):       # « Photo », « Cachet du site » : pas une zone à rédiger
+                continue
+            label = _clean_label(raw)
+        else:
+            label = text_above(f.x0, f.x1, f.y0 - 2) or (ctx.get("area", "").split(" (suite)")[0] + " (suite)"
+                                                         if ctx.get("area") else "")
+        if not label:
+            continue
+        r = pymupdf.Rect(f.x0 + 3, top + 2, f.x1 - 3, f.y1 - 3)
+        if not any(c["rect"].intersects(r) for c in cands):
+            cands.append({"kind": "area", "rect": r, "label": label})
+            ctx["area"] = label
+    # 5) « Nom : » suivi d'un blanc, « du …… au …… », « Le …… à …… » : la case est l'espace laissé libre
+    right = max([w[2] for w in plain] + [page.rect.width * 0.85])
+    walls = frames + [pymupdf.Rect(v[0], v[1], v[0], v[2]) for v in vt]
+
+    def free_until(x, y0, y1):
+        lim = right
+        for f in walls:
+            if _vband(f.y0, f.y1, y0, y1) > 2:
+                if f.x0 > x + 2:
+                    lim = min(lim, f.x0 - 3)
+                elif f.x1 > x + 2:                    # le libellé est dans le cadre
+                    lim = min(lim, f.x1 - 3)
+        return lim
+
+    rows = []
+    for w in sorted(words, key=lambda w: (w[3], w[0])):
+        if rows and abs(rows[-1][0][3] - w[3]) < 3:
+            rows[-1].append(w)
+        else:
+            rows.append([w])
+    for row in rows:
+        row.sort(key=lambda w: w[0])
+        base, start, found = "", 0, False
+        for i, w in enumerate(row):
+            t = w[4]
+            nxt = row[i + 1] if i + 1 < len(row) else None
+            if i and w[0] - row[i - 1][2] > 15:
+                start = i                             # nouveau groupe de mots sur la ligne
+            colon = t.endswith(":")
+            if colon:
+                lab = _clean_label(" ".join(o[4] for o in row[start:i + 1]))
+                if len(lab) > 3:
+                    base = lab
+            starter = colon or t.lower() in SHORT_WORDS or (found and nxt)   # « … heures …… semaines »
+            if not starter or (nxt and nxt[0] - w[2] < 30) or _is_blank(t):
+                continue
+            limit = free_until(w[2], w[1], w[3])
+            end = min(nxt[0] - 4, limit) if nxt else limit
+            if end - w[2] < (26 if nxt and end == nxt[0] - 4 else 40):
+                continue
+            bounded = nxt is not None and nxt[0] - 4 <= limit
+            sx = row[start][0]                        # début du libellé : ce qui est aligné dessous le concerne
+            # « Nom : …… VEDRINE », « Total : …… 12,50 € » : une valeur déjà imprimée, pas un blanc ;
+            # seuls « … heures …… semaines » ou « du …… au …… » laissent un blanc entre deux mots
+            alone = i + 2 >= len(row) or row[i + 2][0] - nxt[2] > 15 if nxt else True
+            if bounded and not (nxt[4].isalpha() and nxt[4].islower() and len(nxt[4]) <= 12 and alone):
+                continue
+            if _is_bullet(row[start][4]):
+                continue                              # « · Locaux techniques : » : un titre de liste
+            if not colon and t.lower() in SHORT_WORDS and not (
+                    base or found or (i == start == 0 and t.lower() == "le")):
+                continue                              # « Du lundi au vendredi » sans libellé sur la ligne
+            if colon and not bounded:
+                h = w[3] - w[1]
+                nxt_row = next((rw for rw in rows if rw[0][3] - w[3] > 3 and rw[0][1] - w[3] < 3.5 * h), None)
+                if nxt_row and not any(o[4].endswith(":") for o in nxt_row) and nxt_row[0][0] >= sx - 30:
+                    first = nxt_row[0]
+                    bullet = _is_bullet(first[4]) or \
+                        len(first[4]) == 1 and len(nxt_row) > 1 and nxt_row[1][0] - first[2] >= 8
+                    value = any(re.search(r"\d", o[4]) for o in nxt_row) and first[1] - w[3] < 2 * h and \
+                        (len(nxt_row) > 1 or len(first[4]) > 3)       # pas le numéro de page
+                    indented = sx + 10 < first[0] < sx + 80
+                    paragraph = first[0] <= sx + 10 and max(o[2] for o in nxt_row) > end - 40
+                    if bullet or value or indented or paragraph:
+                        continue                      # « Préambule : » suivi d'un paragraphe, d'une liste, d'une valeur
+            if not colon and t.lower() in SHORT_WORDS and (
+                    limit < right - 1 or (i and re.search(r"\d", row[i - 1][4]))):
+                continue                              # « 01/09/2022 à 10/10/2022 » dans un tableau
+            r = pymupdf.Rect(w[2] + 3, w[1] + 0.5, end, w[3] - 0.5)
+            if any(c["rect"].intersects(r) for c in cands):
+                continue
+            below = [b for b in boxes if 0 < b.y0 - w[3] < 32 and sx - 5 <= b.x0 <= sx + 40] + \
+                    [o for o in plain if 0 < o[1] - w[3] < 32 and _is_bullet(o[4]) and sx - 5 <= o[0] <= sx + 40]
+            if colon and not bounded and below:
+                continue                              # « Situation du candidat : » suivi d'une liste
+            lab = _clean_label(" ".join(o[4] for o in row[start:i + 1]))
+            if any(c["kind"] == "area" and 0 <= c["rect"].y0 - w[3] < 25 and c["label"].lower().endswith(lab.lower()) for c in cands):
+                continue                              # titre d'une grande zone de texte
+            if t.lower() in SHORT_WORDS and not colon:
+                label = f"{base} — {t}" if base else SHORT_WORDS[t.lower()]
+            else:
+                label = _clean_label(" ".join(o[4] for o in row[start:i + 1])) if colon else base
+                if colon and len(label) <= 3:
+                    label = f"{base} — {SHORT_WORDS.get(label.lower(), label).lower()}" if base else \
+                        SHORT_WORDS.get(label.lower(), label)
+                if bounded and len(nxt[4]) <= 12 and nxt[4].isalpha() and (
+                        i + 2 >= len(row) or row[i + 2][0] - nxt[2] > 15):
+                    label = f"{label} — {nxt[4].lower()}"      # « ……… heures ……… semaines »
+            if not label:
+                continue
+            cands.append({"kind": "text", "rect": r, "label": label})
+            found = True
+            start = i + 1
     # libellés trop courts (« à ») : on ajoute le contexte du champ précédent
     cands.sort(key=lambda c: (round(c["rect"].y1 / 4), c["rect"].x0))
     prev = ctx.get("prev", "")
@@ -584,8 +732,10 @@ def add_detected_fields(doc, page, cands, used_names=None):
         else:
             w.field_type = W_TEXT
             w.text_font = "Helv"
-            w.text_fontsize = 10 if c["kind"] == "text" else max(6.0, min(10.0, c["rect"].height * 0.8))
-            if c["kind"] == "comb":
+            w.text_fontsize = 10 if c["kind"] in ("text", "area") else max(6.0, min(10.0, c["rect"].height * 0.8))
+            if c["kind"] == "area":
+                w.field_flags |= pymupdf.PDF_TX_FIELD_IS_MULTILINE
+            elif c["kind"] == "comb":
                 w.field_flags |= pymupdf.PDF_TX_FIELD_IS_COMB
                 w.text_maxlen = c["n"]
         annot = page.add_widget(w)

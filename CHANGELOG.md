@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.8
+- Field detection on forms without lines: blank after "Label :", "du … au …", "… heures … semaines", "Le … à …", dotted leaders ("Je soussigné(e) ………").
+- Large empty boxes under "Evaluation … :" become multi-line text fields.
+- Checkbox labels placed after a tab ("❑ ⇥ DC1").
+- Headings, paragraphs, lists and printed values are no longer taken for blanks; faster detection on drawing-heavy PDFs.
+
 ## 1.7
 - Field detection: labels glued to their line ("Nom____"), dates "__/__/____" split into day / month / year with JJ / MM / AAAA hints, side-by-side fields on the same line.
 - Fewer false fields: long separator lines and box borders are no longer taken for fields.

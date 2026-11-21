@@ -257,6 +257,16 @@ def create_check_annot(doc, page, cx, cy, size, mark):
     return a
 
 
+def create_image_annot(doc, page, rect, data):
+    """Image/signature déplaçable et redimensionnable (rect : page telle qu'affichée)."""
+    a = page.add_stamp_annot(rect * page.derotation_matrix, stamp=data)
+    a.set_flags(pymupdf.PDF_ANNOT_IS_PRINT)
+    a.update()
+    doc.xref_set_key(a.xref, "T", pymupdf.get_pdf_str(APP_NAME))
+    set_meta(doc, a, {"k": "image"})
+    return a
+
+
 def find_boxes(page, drawings=None):
     """Repère les petites cases carrées dessinées sur la page (formulaires « à imprimer »)."""
     out = []
@@ -1115,6 +1125,7 @@ class PageView(QWidget):
     checkAt = Signal(QPointF, QRectF)
     objectClicked = Signal(int)
     objectMoved = Signal(int, float, float)
+    objectResized = Signal(int, QRectF)
     objectMenu = Signal(int, QPoint)
     fieldMenu = Signal(int, QPoint)
     backgroundClicked = Signal()
@@ -1145,6 +1156,7 @@ class PageView(QWidget):
         self._press_obj = -1
         self._press_pos = None
         self._drag = None
+        self._resize = None      # (index, coin, rectangle d'origine, nouveau rectangle)
 
     def set_content(self, img, scale, pw, ph, fields, images, objects=(), boxes=(), kinds=()):
         self.img, self.scale, self.pw, self.ph = img, scale, pw, ph
@@ -1235,8 +1247,10 @@ class PageView(QWidget):
                     p.drawRect(wr)
                     p.setBrush(Qt.NoBrush)
                     if i == self.hover_obj and not self._drag and i < len(self.object_kinds):
-                        tip = ("✏️ Cliquer pour modifier · glisser pour déplacer" if self.object_kinds[i] == "text"
-                               else ("Cliquer pour enlever" if self.mode == "check" else "Glisser pour déplacer"))
+                        kind = self.object_kinds[i]
+                        tip = ("✏️ Cliquer pour modifier · glisser pour déplacer" if kind == "text"
+                               else ("↔ Glisser pour déplacer · tirer un coin pour agrandir" if kind == "image"
+                                     else ("Cliquer pour enlever" if self.mode == "check" else "Glisser pour déplacer")))
                         f = QFont(self.font())
                         f.setPointSize(9)
                         p.setFont(f)
@@ -1248,6 +1262,20 @@ class PageView(QWidget):
                         p.setPen(QColor("white"))
                         p.drawText(badge, Qt.AlignCenter, tip)
                         p.setBrush(Qt.NoBrush)
+            for i, r in enumerate(self.objects):
+                if (i < len(self.object_kinds) and self.object_kinds[i] == "image"
+                        and (i == self.hover_obj or (self._resize and self._resize[0] == i))):
+                    wr = self.to_widget(r)
+                    p.setPen(QPen(QColor("#2563eb"), 1.5))
+                    p.setBrush(QColor("white"))
+                    for pt in (wr.topLeft(), wr.topRight(), wr.bottomLeft(), wr.bottomRight()):
+                        p.drawRect(QRectF(pt.x() - 5, pt.y() - 5, 10, 10))
+                    p.setBrush(Qt.NoBrush)
+            if self._resize:
+                p.setPen(QPen(QColor("#2563eb"), 2))
+                p.setBrush(QColor(37, 99, 235, 40))
+                p.drawRect(self.to_widget(self._resize[3]))
+                p.setBrush(Qt.NoBrush)
             if self._drag and self._press_obj >= 0:
                 r = self.objects[self._press_obj].translated(*self._drag)
                 p.setPen(QPen(QColor("#2563eb"), 2))
@@ -1285,8 +1313,45 @@ class PageView(QWidget):
                     best, area = i, a
         return best
 
+    HANDLE = 7
+
+    def _handle_at(self, pos):
+        """Retourne (index objet, coin) si la souris est sur une poignée d'image."""
+        for i, r in enumerate(self.objects):
+            if i >= len(self.object_kinds) or self.object_kinds[i] != "image":
+                continue
+            wr = self.to_widget(r)
+            for name, pt in (("tl", wr.topLeft()), ("tr", wr.topRight()),
+                             ("bl", wr.bottomLeft()), ("br", wr.bottomRight())):
+                if abs(pos.x() - pt.x()) <= self.HANDLE + 2 and abs(pos.y() - pt.y()) <= self.HANDLE + 2:
+                    return i, name
+        return None
+
+    def _resized_rect(self, orig, corner, pt):
+        """Nouveau rectangle (proportions conservées) quand on tire le coin `corner` jusqu'à `pt`."""
+        ax = orig.right() if "l" in corner else orig.left()
+        ay = orig.bottom() if "t" in corner else orig.top()
+        aspect = orig.width() / max(orig.height(), 1e-6)
+        w = max(abs(pt.x() - ax), abs(pt.y() - ay) * aspect, 15.0)
+        h = w / aspect
+        x0 = ax - w if "l" in corner else ax
+        y0 = ay - h if "t" in corner else ay
+        return QRectF(x0, y0, w, h)
+
     def mouseMoveEvent(self, e):
         self.mouse = e.position()
+        if self._resize and e.buttons() & Qt.LeftButton:
+            i, corner, orig, _ = self._resize
+            self._resize = (i, corner, orig, self._resized_rect(orig, corner, self.to_pdf(self.mouse)))
+            self.update()
+            return
+        if self.mode in (None, "type", "check"):
+            h = self._handle_at(self.mouse)
+            if h:
+                self.hover_obj = h[0]
+                self.setCursor(Qt.SizeFDiagCursor if h[1] in ("tl", "br") else Qt.SizeBDiagCursor)
+                self.update()
+                return
         if self._press_obj >= 0 and e.buttons() & Qt.LeftButton:
             d = e.position() - self._press_pos
             if self._drag or abs(d.x()) + abs(d.y()) > 5:
@@ -1327,6 +1392,12 @@ class PageView(QWidget):
             return
         self.mouse = e.position()
         obj = self._hit(self.objects, self.mouse) if self.mode in (None, "type", "check") else -1
+        if e.button() == Qt.LeftButton and self.mode in (None, "type", "check"):
+            h = self._handle_at(self.mouse)
+            if h:
+                r = self.objects[h[0]]
+                self._resize = (h[0], h[1], QRectF(r), QRectF(r))
+                return
         if e.button() == Qt.RightButton:
             if obj >= 0:
                 self.objectMenu.emit(obj, e.globalPosition().toPoint())
@@ -1365,6 +1436,13 @@ class PageView(QWidget):
                 self.backgroundClicked.emit()
 
     def mouseReleaseEvent(self, e):
+        if e.button() == Qt.LeftButton and self._resize:
+            i, _c, orig, new = self._resize
+            self._resize = None
+            self.update()
+            if new != orig:
+                self.objectResized.emit(i, new)
+            return
         if e.button() != Qt.LeftButton or self._press_obj < 0:
             return
         i, drag = self._press_obj, self._drag
@@ -2511,6 +2589,7 @@ class MainWindow(QMainWindow):
         save_menu.addAction("💾  Enregistrer", self.save)
         save_menu.addAction("📑  Enregistrer sous… (garder l'original)", self.save_as)
         save_menu.addAction("🗜️  Enregistrer une version plus légère…", self.compress_doc)
+        save_menu.addAction("🖼️  Exporter en image (PNG / JPG)…", self.export_images)
         self.b_save.setMenu(save_menu)
         self.b_save.setPopupMode(QToolButton.MenuButtonPopup)
         self.b_print = big_button("🖨️", "Imprimer", "Imprimer le document (Ctrl+P)", self.print_doc)
@@ -2687,7 +2766,9 @@ class MainWindow(QMainWindow):
         self.view.typeAt.connect(self.on_type_at)
         self.view.checkAt.connect(self.on_check_at)
         self.view.objectClicked.connect(self.on_object_clicked)
+        self.view.objectResized.connect(self.on_object_resized)
         self.view.objectMoved.connect(self.on_object_moved)
+        self.view.objectResized.connect(self.on_object_resized)
         self.view.objectMenu.connect(self.on_object_menu)
         self.view.fieldMenu.connect(self.on_field_menu)
         self.view.backgroundClicked.connect(lambda: self._commit_field_editor())
@@ -3423,6 +3504,45 @@ class MainWindow(QMainWindow):
             self.flash(f"📤 {len(pages)} page(s) enregistrée(s) dans <b>{os.path.basename(path)}</b>.")
         new.close()
 
+    def export_images(self):
+        """Enregistre les pages (sélectionnées) sous forme d'images PNG ou JPG."""
+        if not self.doc:
+            return
+        self._flush_all()
+        pages = self.selected_pages() or [self.current]
+        base = os.path.splitext(self.display_name)[0]
+        folder = os.path.dirname(self.path) if self.path else documents_dir()
+        filt = "Image PNG (*.png);;Image JPG (*.jpg)"
+        if len(pages) == 1:
+            path, sel = QFileDialog.getSaveFileName(self, "Exporter la page en image",
+                                                    os.path.join(folder, f"{base} - page {pages[0] + 1}.png"), filt)
+            if not path:
+                return
+            ext = ".jpg" if ("jpg" in sel.lower() and not path.lower().endswith((".png", ".jpg", ".jpeg"))) \
+                or path.lower().endswith((".jpg", ".jpeg")) else ".png"
+            if not path.lower().endswith((".png", ".jpg", ".jpeg")):
+                path += ext
+            targets = [(pages[0], path)]
+        else:
+            ans = ask(self, f"Exporter {len(pages)} pages en images ?\n\nUne image par page sera créée dans un "
+                            "dossier que vous allez choisir.",
+                      [("Choisir le dossier…", QMessageBox.AcceptRole), ("Annuler", QMessageBox.RejectRole)])
+            if ans != 0:
+                return
+            out = QFileDialog.getExistingDirectory(self, "Dossier où enregistrer les images", folder)
+            if not out:
+                return
+            targets = [(p, os.path.join(out, f"{base} - page {p + 1}.png")) for p in pages]
+        try:
+            for p, path in targets:
+                pix = self.doc[p].get_pixmap(matrix=pymupdf.Matrix(200 / 72, 200 / 72), alpha=False)
+                pix.save(path, jpg_quality=92) if path.lower().endswith((".jpg", ".jpeg")) else pix.save(path)
+        except Exception as e:
+            warn(self, "Impossible d'enregistrer l'image.", detail=str(e))
+            return
+        self.flash(f"🖼️ {len(targets)} image(s) enregistrée(s) : <b>{os.path.basename(targets[0][1])}</b>"
+                   + (" …" if len(targets) > 1 else "."))
+
     def combine(self, images=False):
         dlg = CombineDialog(self, images_mode=images)
         if dlg.exec() != QDialog.Accepted:
@@ -3884,8 +4004,12 @@ class MainWindow(QMainWindow):
         a = find_annot(page, obj["xref"])
         if a is None:
             return
-        page.delete_annot(a)
         meta, r = obj["meta"], obj["rect"]
+        if meta.get("k") != "image":
+            page.delete_annot(a)
+        if meta.get("k") == "image":
+            a.set_rect(pymupdf.Rect(r.x0 + dx, r.y0 + dy, r.x1 + dx, r.y1 + dy) * page.derotation_matrix)
+            return
         if meta.get("k") == "text":
             create_text_annot(self.doc, page, r.x0 + dx, r.y0 + dy, meta)
         else:
@@ -3898,6 +4022,9 @@ class MainWindow(QMainWindow):
         obj = self.page_objects[i]
         if obj["meta"].get("k") == "text":
             self.edit_text_object(obj)
+        elif obj["meta"].get("k") == "image":
+            self.flash("🖼️ Faites glisser pour déplacer, tirez sur un coin pour redimensionner, "
+                       "ou faites un clic droit pour supprimer.", kind="mode")
         elif self.mode == "check":
             self.delete_object(obj)
         else:
@@ -3914,6 +4041,22 @@ class MainWindow(QMainWindow):
         self.render_current()
         self.update_thumbs([self.current])
 
+    def on_object_resized(self, i, rect):
+        if i >= len(self.page_objects):
+            return
+        self._commit_editor()
+        obj = self.page_objects[i]
+        page = self.doc[self.current]
+        a = find_annot(page, obj["xref"])
+        if a is None:
+            return
+        self.snapshot()
+        r = pymupdf.Rect(rect.x(), rect.y(), rect.right(), rect.bottom()) & page.rect
+        a.set_rect(r * page.derotation_matrix)
+        a.update()
+        self.render_current()
+        self.update_thumbs([self.current])
+
     def on_object_menu(self, i, pos):
         if i >= len(self.page_objects):
             return
@@ -3922,9 +4065,19 @@ class MainWindow(QMainWindow):
         if obj["meta"].get("k") == "text":
             m.addAction("✏️  Modifier le texte", lambda: self.edit_text_object(obj))
             m.addAction("🗑  Supprimer ce texte", lambda: self.delete_object(obj))
+        elif obj["meta"].get("k") == "image":
+            m.addAction("➕  Agrandir", lambda: self._scale_object(obj, 1.15))
+            m.addAction("➖  Réduire", lambda: self._scale_object(obj, 1 / 1.15))
+            m.addAction("🗑  Supprimer", lambda: self.delete_object(obj))
         else:
             m.addAction("🗑  Supprimer la coche", lambda: self.delete_object(obj))
         m.exec(pos)
+
+    def _scale_object(self, obj, f):
+        r = obj["rect"]
+        c = (r.tl + r.br) / 2
+        w, h = r.width * f, r.height * f
+        self.on_object_resized(self.page_objects.index(obj), QRectF(c.x - w / 2, c.y - h / 2, w, h))
 
     def delete_object(self, obj):
         self._commit_editor()
@@ -3947,9 +4100,9 @@ class MainWindow(QMainWindow):
         self.snapshot()
         try:
             if self.mode == "place_image":
-                page.insert_image(rect * page.derotation_matrix, stream=self._ghost_bytes,
-                                  rotate=page.rotation, keep_proportion=True)
-                msg = "✅ Ajouté ! S'il n'est pas bien placé, cliquez sur « Annuler » et recommencez."
+                create_image_annot(self.doc, page, rect, self._ghost_bytes)
+                msg = ("✅ Ajouté ! Faites-le glisser pour le déplacer, ou tirez sur un coin pour le "
+                       "redimensionner.")
             else:
                 self.drop_snapshot()
                 return

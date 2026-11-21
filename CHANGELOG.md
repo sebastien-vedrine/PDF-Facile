@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+- Signatures and added images can be moved, resized (drag a corner, or right-click → Agrandir / Réduire) and deleted after placing them.
+- New "Exporter en image (PNG / JPG)" entry in the Save menu: exports the current/selected pages as images.
+
 ## 1.8
 - Field detection on forms without lines: blank after "Label :", "du … au …", "… heures … semaines", "Le … à …", dotted leaders ("Je soussigné(e) ………").
 - Large empty boxes under "Evaluation … :" become multi-line text fields.

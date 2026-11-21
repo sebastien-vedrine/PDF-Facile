@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.9
 - Signatures and added images can be moved, resized (drag a corner, or right-click → Agrandir / Réduire) and deleted after placing them.
 - New "Exporter en image (PNG / JPG)" entry in the Save menu: exports the current/selected pages as images.
 

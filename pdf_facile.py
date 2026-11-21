@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QC
                                QStackedWidget, QToolButton, QVBoxLayout, QWidget)
 
 APP_NAME = "PDF Facile"
-APP_VERSION = "1.8"
+APP_VERSION = "1.9"
 APP_URL = "https://github.com/sebastien-vedrine/PDF-Facile"
 ORG_NAME = "PDFFacile"
 MAX_UNDO = 30
